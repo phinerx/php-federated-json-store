@@ -1,1 +1,151 @@
-<?php\n\nnamespace FederatedJsonStore;\n\nuse Psr\Log\LoggerInterface;\nuse GuzzleHttp\Client as HttpClient;\nuse FederatedJsonStore\Config\AppConfig;\nuse FederatedJsonStore\Exception\FederationException;\n\n/**\n * Manages inter-node communication, discovery, and request routing within the federated JSON store.\n * This class is central to maintaining the distributed nature of the system, ensuring data\n * consistency and availability across multiple participating nodes.\n */\nclass FederationManager\n{\n    private LoggerInterface $logger;\n    private AppConfig $config;\n    private HttpClient $httpClient;\n    private array $activeNodes = [];\n\n    /**\n     * Initializes the FederationManager with necessary dependencies.\n     * @param LoggerInterface $logger A PSR-3 compliant logger instance.\n     * @param AppConfig $config The application configuration object.\n     * @param HttpClient|null $httpClient An optional HTTP client instance for inter-node communication.\n     */\n    public function __construct(LoggerInterface $logger, AppConfig $config, ?HttpClient $httpClient = null)\n    {\n        $this->logger = $logger;\n        $this->config = $config;\n        $this->httpClient = $httpClient ?? new HttpClient([\n            'timeout'  => $this->config->get('federation.http_timeout', 5),\n            'connect_timeout' => $this->config->get('federation.http_connect_timeout', 2),\n        ]);\n\n        $this->loadInitialNodes();\n    }\n\n    /**\n     * Loads initial peer nodes from configuration.\n     * This method is typically called during system startup to populate the initial federation topology.\n     */\n    private function loadInitialNodes(): void\n    {\n        $initialPeers = $this->config->get('federation.initial_peers', []);\n        foreach ($initialPeers as $peerUrl) {\n            if (filter_var($peerUrl, FILTER_VALIDATE_URL)) {\n                $this->activeNodes[$peerUrl] = ['status' => 'unknown', 'last_check' => 0];\n                $this->logger->info("Registered initial peer node: {url}", ['url' => $peerUrl]);\n            } else {\n                $this->logger->warning("Invalid initial peer URL configured: {url}", ['url' => $peerUrl]);\n            }\n        }\n    }\n\n    /**\n     * Registers a new node with the federation.\n     * This method allows other nodes to announce their presence or for a central coordinator\n     * to add new participants dynamically.\n     * @param string $nodeUrl The base URL of the node to register.\n     * @return bool True if registration was successful, false otherwise.\n     */\n    public function registerNode(string $nodeUrl): bool\n    {\n        if (!filter_var($nodeUrl, FILTER_VALIDATE_URL)) {\n            $this->logger->error("Attempted to register invalid node URL: {url}", ['url' => $nodeUrl]);\n            return false;\n        }\n\n        if (isset($this->activeNodes[$nodeUrl])) {\n            $this->logger->debug("Node {url} already registered.", ['url' => $nodeUrl]);\n            return true;\n        }\n\n        $this->activeNodes[$nodeUrl] = ['status' => 'pending', 'last_check' => time()];\n        $this->logger->info("Node {url} registered.", ['url' => $nodeUrl]);\n        // Optionally, ping the node to verify its availability immediately\n        $this->checkNodeStatus($nodeUrl);\n        return true;\n    }\n\n    /**\n     * Discovers active nodes within the federation.\n     * This could involve broadcasting, querying known nodes, or consulting a discovery service.\n     * For simplicity, this example iterates through known nodes and checks their status.\n     * @return array An array of currently active node URLs.\n     */\n    public function discoverNodes(): array\n    {\n        $active = [];\n        foreach ($this->activeNodes as $nodeUrl => $data) {\n            if ($this->checkNodeStatus($nodeUrl)) {\n                $active[] = $nodeUrl;\n            }\n        }\n        return $active;\n    }\n\n    /**\n     * Checks the operational status of a specific node.\n     * This typically involves sending a lightweight health check request.\n     * @param string $nodeUrl The URL of the node to check.\n     * @return bool True if the node is responsive and healthy, false otherwise.\n     */\n    private function checkNodeStatus(string $nodeUrl): bool\n    {\n        $currentTime = time();\n        $lastCheck = $this->activeNodes[$nodeUrl]['last_check'] ?? 0;\n        $checkInterval = $this->config->get('federation.health_check_interval', 30);\n\n        if (($currentTime - $lastCheck) < $checkInterval) {\n            // Avoid frequent checks\n            return $this->activeNodes[$nodeUrl]['status'] === 'healthy';\n        }\n\n        try {\n            $this->logger->debug("Performing health check for node: {url}", ['url' => $nodeUrl]);\n            $response = $this->httpClient->get("$nodeUrl/health", ['timeout' => 2]);\n\n            if ($response->getStatusCode() === 200) {\n                $this->activeNodes[$nodeUrl]['status'] = 'healthy';\n                $this->activeNodes[$nodeUrl]['last_check'] = $currentTime;\n                $this->logger->info("Node {url} is healthy.", ['url' => $nodeUrl]);\n                return true;\n            }\n        } catch (\Exception $e) {\n            $this->logger->warning("Node {url} health check failed: {message}", [\n                'url' => $nodeUrl, 'message' => $e->getMessage()\n            ]);\n        }\n\n        $this->activeNodes[$nodeUrl]['status'] = 'unhealthy';\n        $this->activeNodes[$nodeUrl]['last_check'] = $currentTime;\n        return false;\n    }\n\n    /**\n     * Forwards a request to a specific node or a suitable node in the federation.\n     * This method is crucial for routing client requests to the correct data shard or replica.\n     * @param string $method The HTTP method (GET, POST, PUT, DELETE).\n     * @param string $path The API path relative to the node's base URL.\n     * @param array $options Request options (e.g., query parameters, body, headers).\n     * @param string|null $targetNodeUrl Optional: specific node URL to target. If null, a suitable node is chosen.\n     * @return array The response body from the target node, decoded as an array.\n     * @throws FederationException If the request fails or no suitable node is found.\n     */\n    public function forwardRequest(string $method, string $path, array $options = [], ?string $targetNodeUrl = null): array\n    {\n        $nodesToTry = [];\n        if ($targetNodeUrl && isset($this->activeNodes[$targetNodeUrl]) && $this->activeNodes[$targetNodeUrl]['status'] === 'healthy') {\n            $nodesToTry[] = $targetNodeUrl;\n        } else {\n            // Select healthy nodes for routing\n            $nodesToTry = array_filter(array_keys($this->activeNodes), function ($nodeUrl) {\n                return $this->activeNodes[$nodeUrl]['status'] === 'healthy';\n            });\n            shuffle($nodesToTry); // Simple load balancing/random selection\n        }\n\n        if (empty($nodesToTry)) {\n            throw new FederationException("No healthy nodes available to forward request.");\n        }\n\n        foreach ($nodesToTry as $nodeUrl) {\n            try {\n                $fullUrl = rtrim($nodeUrl, '/') . '/' . ltrim($path, '/');\n                $this->logger->info("Forwarding {method} request to {url}", ['method' => $method, 'url' => $fullUrl]);\n                $response = $this->httpClient->request($method, $fullUrl, $options);\n\n                if ($response->getStatusCode() >= 200 && $response->getStatusCode() < 300) {\n                    return json_decode($response->getBody()->getContents(), true);\n                } else {\n                    $this->logger->warning("Forwarded request to {url} returned non-success status: {status}", [\n                        'url' => $fullUrl, 'status' => $response->getStatusCode()\n                    ]);\n                }\n            } catch (\Exception $e) {\n                $this->logger->error("Failed to forward request to {url}: {message}", [\n                    'url' => $nodeUrl, 'message' => $e->getMessage()\n                ]);\n                // Mark node as unhealthy temporarily\n                $this->activeNodes[$nodeUrl]['status'] = 'unhealthy';\n                $this->activeNodes[$nodeUrl]['last_check'] = time();\n            }\n        }\n\n        throw new FederationException("All attempts to forward request failed.");\n    }\n\n    /**\n     * Returns the current list of active nodes and their statuses.\n     * @return array Associative array where keys are node URLs and values are their status data.\n     */\n    public function getActiveNodes(): array\n    {\n        return $this->activeNodes;\n    }\n\n    /**\n     * Unregisters a node from the federation.\n     * @param string $nodeUrl The URL of the node to unregister.\n     * @return bool True if the node was successfully unregistered, false otherwise.\n     */\n    public function unregisterNode(string $nodeUrl): bool\n    {\n        if (isset($this->activeNodes[$nodeUrl])) {\n            unset($this->activeNodes[$nodeUrl]);\n            $this->logger->info("Node {url} unregistered.", ['url' => $nodeUrl]);\n            return true;\n        }\n        $this->logger->warning("Attempted to unregister unknown node: {url}", ['url' => $nodeUrl]);\n        return false;\n    }\n\n    // Placeholder for more advanced data distribution logic\n    /**\n     * Initiates data distribution or replication across the federation.\n     * This method would typically be called by a DataStoreService or ShardManager.\n     * @param string $documentId The ID of the document to distribute.\n     * @param array $documentData The document content.\n     * @param array $targetNodes Optional: specific nodes to distribute to. If empty, uses federation policy.\n     * @return bool True if distribution was initiated successfully, false otherwise.\n     */\n    public function distributeData(string $documentId, array $documentData, array $targetNodes = []): bool\n    {\n        $this->logger->info("Initiating data distribution for document {id}.", ['id' => $documentId]);\n        // In a real system, this would involve sharding, replication factors, consensus protocols.\n        // For now, it's a placeholder to demonstrate the manager's role in coordination.\n        $nodes = empty($targetNodes) ? $this->discoverNodes() : $targetNodes;\n\n        if (empty($nodes)) {\n            $this->logger->error("No nodes available for data distribution.");\n            return false;\n        }\n\n        foreach ($nodes as $nodeUrl) {\n            try {\n                // Example: send data to a node's internal API endpoint\n                $this->forwardRequest('POST', "data/internal/{$documentId}", [\n                    'json' => $documentData,\n                    'headers' => ['X-Federation-Internal' => 'true'] // Internal flag\n                ], $nodeUrl);\n                $this->logger->debug("Distributed document {id} to {node}", ['id' => $documentId, 'node' => $nodeUrl]);\n            } catch (FederationException $e) {\n                $this->logger->error("Failed to distribute document {id} to {node}: {message}", [\n                    'id' => $documentId, 'node' => $nodeUrl, 'message' => $e->getMessage()\n                ]);\n            }\n        }\n        return true; // Assume success if at least one attempt was made, refine later.\n    }\n}
+<?php
+
+namespace FederatedJsonStore;
+
+use FederatedJsonStore\Contracts\{NodeRegistryInterface, DataRouterInterface, LoggerInterface};
+use FederatedJsonStore\Exceptions\{NodeNotFoundException, DataDistributionException, QueryExecutionException};
+use FederatedJsonStore\ValueObjects\Node;
+
+/**
+ * Manages the federation of distributed JSON stores, orchestrating node interactions,
+ * data distribution, and query routing across the network.
+ */
+final class FederationManager
+{
+    private NodeRegistryInterface $nodeRegistry;
+    private DataRouterInterface $dataRouter;
+    private LoggerInterface $logger;
+
+    public function __construct(
+        NodeRegistryInterface $nodeRegistry,
+        DataRouterInterface $dataRouter,
+        LoggerInterface $logger
+    ) {
+        $this->nodeRegistry = $nodeRegistry;
+        $this->dataRouter = $dataRouter;
+        $this->logger = $logger;
+    }
+
+    /**
+     * Registers a new node within the federation.
+     *
+     * @param Node $node The node to register.
+     * @return bool True if registration was successful, false otherwise.
+     */
+    public function registerNode(Node $node): bool
+    {
+        try {
+            $this->nodeRegistry->addNode($node);
+            $this->logger->info(sprintf("Node '%s' registered successfully.", $node->getId()));
+            return true;
+        } catch (\Exception $e) {
+            $this->logger->error(sprintf("Failed to register node '%s': %s", $node->getId(), $e->getMessage()));
+            return false;
+        }
+    }
+
+    /**
+     * Deregisters an existing node from the federation.
+     *
+     * @param string $nodeId The ID of the node to deregister.
+     * @return bool True if deregistration was successful, false otherwise.
+     * @throws NodeNotFoundException If the specified node does not exist.
+     */
+    public function deregisterNode(string $nodeId): bool
+    {
+        try {
+            $this->nodeRegistry->removeNode($nodeId);
+            $this->logger->info(sprintf("Node '%s' deregistered successfully.", $nodeId));
+            return true;
+        } catch (NodeNotFoundException $e) {
+            $this->logger->warning(sprintf("Attempted to deregister non-existent node '%s'.", $nodeId));
+            throw $e;
+        } catch (\Exception $e) {
+            $this->logger->error(sprintf("Failed to deregister node '%s': %s", $nodeId, $e->getMessage()));
+            return false;
+        }
+    }
+
+    /**
+     * Distributes a data payload to the appropriate node(s) based on routing logic.
+     *
+     * @param string $key The primary key for the data.
+     * @param array $data The data payload to distribute.
+     * @param array $metadata Optional metadata for distribution.
+     * @return array A list of node IDs where the data was successfully distributed.
+     * @throws DataDistributionException If data distribution fails for critical nodes.
+     */
+    public function distributeData(string $key, array $data, array $metadata = []): array
+    {
+        try {
+            $targetNodes = $this->dataRouter->routeData($key, $data, $this->nodeRegistry->getAllNodes());
+            if (empty($targetNodes)) {
+                throw new DataDistributionException("No suitable nodes found for data distribution with key: " . $key);
+            }
+
+            $successfulNodes = [];
+            foreach ($targetNodes as $node) {
+                // In a real system, this would involve network calls to the node.
+                // For this example, we'll simulate success.
+                $this->logger->debug(sprintf("Attempting to send data for key '%s' to node '%s'.", $key, $node->getId()));
+                // simulate network call
+                if (rand(0, 10) < 9) { // 90% success rate simulation
+                    $successfulNodes[] = $node->getId();
+                    $this->logger->info(sprintf("Data for key '%s' successfully distributed to node '%s'.", $key, $node->getId()));
+                } else {
+                    $this->logger->warning(sprintf("Failed to distribute data for key '%s' to node '%s'.", $key, $node->getId()));
+                }
+            }
+
+            if (empty($successfulNodes)) {
+                throw new DataDistributionException(sprintf("Failed to distribute data for key '%s' to any target node.", $key));
+            }
+
+            return $successfulNodes;
+        } catch (DataDistributionException $e) {
+            $this->logger->error(sprintf("Critical data distribution failure for key '%s': %s", $key, $e->getMessage()));
+            throw $e;
+        } catch (\Exception $e) {
+            $this->logger->critical(sprintf("Unexpected error during data distribution for key '%s': %s", $key, $e->getMessage()));
+            throw new DataDistributionException("Unexpected error during data distribution.", 0, $e);
+        }
+    }
+
+    /**
+     * Executes a query across the federated store, routing it to relevant nodes.
+     *
+     * @param string $query A string representing the query (e.g., JSONPath, custom DSL).
+     * @param array $params Optional query parameters.
+     * @return array The aggregated results from the queried nodes.
+     * @throws QueryExecutionException If the query cannot be executed or results aggregated.
+     */
+    public function executeQuery(string $query, array $params = []): array
+    {
+        try {
+            $relevantNodes = $this->dataRouter->routeQuery($query, $params, $this->nodeRegistry->getAllNodes());
+            if (empty($relevantNodes)) {
+                $this->logger->warning(sprintf("No relevant nodes found for query: '%s'", $query));
+                return [];
+            }
+
+            $aggregatedResults = [];
+            foreach ($relevantNodes as $node) {
+                // In a real system, this would involve sending the query to the node and collecting results.
+                // Simulate query execution and result aggregation.
+                $this->logger->debug(sprintf("Executing query '%s' on node '%s'.", $query, $node->getId()));
+                // simulate network call and result
+                $nodeResults = ['node' => $node->getId(), 'data' => ['simulated_result_field' => uniqid('res_')]];
+                $aggregatedResults[] = $nodeResults;
+            }
+
+            $this->logger->info(sprintf("Query '%s' executed across %d nodes, %d results aggregated.", $query, count($relevantNodes), count($aggregatedResults)));
+            return $aggregatedResults;
+        } catch (QueryExecutionException $e) {
+            $this->logger->error(sprintf("Query execution failure for '%s': %s", $query, $e->getMessage()));
+            throw $e;
+        } catch (\Exception $e) {
+            $this->logger->critical(sprintf("Unexpected error during query execution for '%s': %s", $query, $e->getMessage()));
+            throw new QueryExecutionException("Unexpected error during query execution.", 0, $e);
+        }
+    }
+}
